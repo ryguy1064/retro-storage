@@ -49,9 +49,10 @@
 #define BUS_INTERFACE_REG_SEL_mask              (1 << 7)
 
 // Global variables
-static uint16_t registerPointer = 0;
-static uint16_t newRegisterPointer = 0;
-static uint8_t newRegisterPointerByteIndex = 0;
+static uint16_t gRegisterPointer = 0;
+static uint16_t gNewRegisterPointer = 0;
+static uint8_t gNewRegisterPointerByteIndex = 0;
+static bool gLastRegisterOpWasWrite = false;
 
 // Register map
 //
@@ -64,15 +65,20 @@ static uint8_t newRegisterPointerByteIndex = 0;
 //   0x0: Default drive properties (read from HW jumpers) (0 = None, 1 = 5.25" DD, 2 = 5.25" DD in HD drive, 3 = 5.25" HD, 4 = 3.5" DD, 5 = 3.5" HD)
 //   0x1: Configured drive properties (overrides default)
 //   0x2 - 0x5: Max LBA (512-byte sectors)
-//   0x6 - 0xf: Reserved (0x00000000)
+//   0x6 - 0xf: Reserved (0x00)
 //
 // Common parameters
 // 0x040: Drive select (0 = Drive A, 1 = Drive B, 2 = Drive C, 3 = Drive D)
 // 0x041 - 0x044: Drive LBA (0x00000000 - 0xFFFFFFFF)
 // 0x045: Drive operation (0 = Controller reset, 1 = Read sector from drive into buffer, 2 = Write sector to drive from buffer, 3 = Format (floppy: low-level))
 // 0x046: Drive status (0 = No error, 1 = Invalid param, 2 = Write-protected, 3 = Read/write error, 4 = Not ready, 5 = Timeout)
-// 
+// 0x047 - 0x0FF: Reserved (0x00)
+//
+// R/W Buffer
 // 0x100 - 0x2FF: R/W buffer for drive's sector data (512 bytes)
+//
+// Reserved
+// 0x300 - 0xFFFF: Reserved (0x00)
 
 #define REG_ADDR__DRIVE_NUM_MASK 0x030
 #define REG_ADDR__DRIVE_NUM_SHIFT 4
@@ -120,7 +126,8 @@ typedef enum
     _WRITE_PROTECTED = 2,
     _READ_WRITE_ERROR = 3,
     _NOT_READY = 4,
-    _TIMEOUT = 5
+    _BUSY = 5,
+    _TIMEOUT = 6
 } drive_status_t;
 
 typedef enum
@@ -140,7 +147,7 @@ typedef struct
     uint32_t maxLBA;
 } drive_properties_t;
 
-drive_properties_t driveProperties[4] = 
+drive_properties_t gDriveProperties[4] = 
 {
     { _3_5_HD, _3_5_HD, (1440UL*1024/512) },
     { _5_25_DD_in_HD_drive, _5_25_DD_in_HD_drive, (320UL*1024/512) },
@@ -148,13 +155,12 @@ drive_properties_t driveProperties[4] =
     { _NONE, _NONE, 0x00000000 }
 };
 
-bool readDataNeedsUpdate = false;
-drive_num_t driveSelect = DRIVE_A;
-uint32_t driveLBA = 0x00000000;
-drive_operation_t driveOperation = _NOOP;
-drive_status_t driveStatus = _NO_ERROR;
+drive_num_t gDriveSelect = DRIVE_A;
+uint32_t gDriveLBA = 0x00000000;
+drive_operation_t gDriveOperation = _NOOP;
+drive_status_t gDriveStatus = _NO_ERROR;
 
-uint8_t rwBuffer[REG_SIZE__RW_BUFFER] = { 0x00 };
+uint8_t gRwBuffer[REG_SIZE__RW_BUFFER] = { 0x00 };
 
 inline bool isRegisterSelectPointer()
 {
@@ -240,6 +246,7 @@ uint16_t getNextRegisterPointer(uint16_t p)
     }
 
     // Otherwise, increment register pointer
+    else
     {
         p++;
     }
@@ -251,6 +258,7 @@ uint8_t getRegisterData(uint16_t p)
 {
     uint8_t data;
 
+    // Per-drive parameters
     if ((p >= REG_ADDR__DRIVE_A) && (p < REG_ADDR__DRIVE_SELECT))
     {
         drive_num_t drive = (drive_num_t)((p & REG_ADDR__DRIVE_NUM_MASK) >> REG_ADDR__DRIVE_NUM_SHIFT);
@@ -259,27 +267,27 @@ uint8_t getRegisterData(uint16_t p)
         switch (property)
         {
         case REG_ADDR__DRIVE_PROPERTY_DEFAULT:
-            data = (uint8_t)driveProperties[drive].def;
+            data = (uint8_t)gDriveProperties[drive].def;
             break;
 
         case REG_ADDR__DRIVE_PROPERTY_CONFIGURED:
-            data = (uint8_t)driveProperties[drive].configured;
+            data = (uint8_t)gDriveProperties[drive].configured;
             break;
 
         case REG_ADDR__DRIVE_PROPERTY_MAX_LBA+0:
-            data = (uint8_t)(driveProperties[drive].maxLBA & 0x000000FF);
+            data = (uint8_t)((gDriveProperties[drive].maxLBA & 0x000000FF) >> 0);
             break;
 
         case REG_ADDR__DRIVE_PROPERTY_MAX_LBA+1:
-            data = (uint8_t)((driveProperties[drive].maxLBA & 0x0000FF00) >> 8);
+            data = (uint8_t)((gDriveProperties[drive].maxLBA & 0x0000FF00) >> 8);
             break;
 
         case REG_ADDR__DRIVE_PROPERTY_MAX_LBA+2:
-            data = (uint8_t)((driveProperties[drive].maxLBA & 0x00FF0000) >> 16);
+            data = (uint8_t)((gDriveProperties[drive].maxLBA & 0x00FF0000) >> 16);
             break;
 
         case REG_ADDR__DRIVE_PROPERTY_MAX_LBA+3:
-            data = (uint8_t)((driveProperties[drive].maxLBA & 0xFF000000) >> 24);
+            data = (uint8_t)((gDriveProperties[drive].maxLBA & 0xFF000000) >> 24);
 
         default:
             data = 0;
@@ -287,36 +295,37 @@ uint8_t getRegisterData(uint16_t p)
         }
     }
 
-    else if ((p >= REG_ADDR__DRIVE_SELECT) && (p <= REG_ADDR__DRIVE_STATUS))
+    // Common parameters
+    else if ((p >= REG_ADDR__DRIVE_SELECT) && (p < REG_ADDR__RW_BUFFER))
     {
         switch (p)
         {
         case REG_ADDR__DRIVE_SELECT:
-            data = (uint8_t)driveSelect;
+            data = (uint8_t)gDriveSelect;
             break;
 
         case REG_ADDR__DRIVE_LBA+0:
-            data = (uint8_t)(driveLBA & 0x000000FF);
+            data = (uint8_t)(gDriveLBA & 0x000000FF);
             break;
 
         case REG_ADDR__DRIVE_LBA+1:
-            data = (uint8_t)((driveLBA & 0x0000FF00) >> 8);
+            data = (uint8_t)((gDriveLBA & 0x0000FF00) >> 8);
             break;
 
         case REG_ADDR__DRIVE_LBA+2:
-            data = (uint8_t)((driveLBA & 0x00FF0000) >> 16);
+            data = (uint8_t)((gDriveLBA & 0x00FF0000) >> 16);
             break;
 
         case REG_ADDR__DRIVE_LBA+3:
-            data = (uint8_t)((driveLBA & 0xFF000000) >> 24);
+            data = (uint8_t)((gDriveLBA & 0xFF000000) >> 24);
             break;
 
         case REG_ADDR__DRIVE_OPERATION:
-            data = (uint8_t)driveOperation;
+            data = (uint8_t)gDriveOperation;
             break;
 
         case REG_ADDR__DRIVE_STATUS:
-            data = (uint8_t)driveStatus;
+            data = (uint8_t)gDriveStatus;
             break;
 
         default:
@@ -326,9 +335,15 @@ uint8_t getRegisterData(uint16_t p)
     }
 
     // Reading from buffer
+    else if ((p >= REG_ADDR__RW_BUFFER) && (p < (REG_ADDR__RW_BUFFER + REG_SIZE__RW_BUFFER)))
+    {
+        data = gRwBuffer[p - REG_ADDR__RW_BUFFER];
+    }
+
+    // Unknown
     else
     {
-        data = rwBuffer[p - REG_ADDR__RW_BUFFER];
+        data = 0;
     }
 
     return data;
@@ -336,6 +351,7 @@ uint8_t getRegisterData(uint16_t p)
 
 void setRegisterData(uint16_t p, uint8_t data)
 {
+    // Per-drive parameters
     if ((p >= REG_ADDR__DRIVE_A) && (p < REG_ADDR__DRIVE_SELECT))
     {
         drive_num_t drive = (drive_num_t)((p & REG_ADDR__DRIVE_NUM_MASK) >> REG_ADDR__DRIVE_NUM_SHIFT);
@@ -345,7 +361,7 @@ void setRegisterData(uint16_t p, uint8_t data)
         {
         case REG_ADDR__DRIVE_PROPERTY_CONFIGURED:
         {
-            driveProperties[drive].configured = (drive_type_t)data;
+            gDriveProperties[drive].configured = (drive_type_t)data;
             break;
         }
 
@@ -355,44 +371,55 @@ void setRegisterData(uint16_t p, uint8_t data)
         }
     }
 
-    else if ((p >= REG_ADDR__DRIVE_SELECT) && (p <= REG_ADDR__DRIVE_STATUS))
+    // Common parameters
+    else if ((p >= REG_ADDR__DRIVE_SELECT) && (p < REG_ADDR__RW_BUFFER))
     {
         switch (p)
         {
         case REG_ADDR__DRIVE_SELECT:
-            driveSelect = (drive_num_t)data;
+            gDriveSelect = (drive_num_t)data;
             break;
 
         case REG_ADDR__DRIVE_LBA+0:
-            driveLBA = data;
+            gDriveLBA = data;
             break;
 
         case REG_ADDR__DRIVE_LBA+1:
-            driveLBA |= ((uint32_t)data << 8);
+            gDriveLBA |= ((uint32_t)data << 8);
             break;
 
         case REG_ADDR__DRIVE_LBA+2:
-            driveLBA |= ((uint32_t)data << 16);
+            gDriveLBA |= ((uint32_t)data << 16);
             break;
 
         case REG_ADDR__DRIVE_LBA+3:
-            driveLBA |= ((uint32_t)data << 24);
+            gDriveLBA |= ((uint32_t)data << 24);
             break;
 
         case REG_ADDR__DRIVE_OPERATION:
-            driveOperation = (drive_operation_t)data;
+            gDriveOperation = (drive_operation_t)data;
+            if (gDriveOperation != _NOOP)
+            {
+                // Set drive status to busy right away so it gets sent back to the Z80 when STATUS is read next
+                gDriveStatus = _BUSY;
+            }
+            break;
+
+        case REG_ADDR__DRIVE_STATUS:
+            // Do nothing (drive status is read-only)
             break;
 
         default:
+            // Do nothing (reserved)
             break;
         }
     }
 
     // Writing to buffer
-    else
+    else if ((p >= REG_ADDR__RW_BUFFER) && (p < (REG_ADDR__RW_BUFFER + REG_SIZE__RW_BUFFER)))
     {
         // Write data to buffer
-        rwBuffer[p - REG_ADDR__RW_BUFFER] = data;
+        gRwBuffer[p - REG_ADDR__RW_BUFFER] = data;
     }
 }
 
@@ -428,10 +455,7 @@ void setup() {
 
     // Prime the first register data
     //   Read data at register pointer and write it onto the bus interface
-    writeDataToZ80(getRegisterData(registerPointer));
-
-    //   Move to the next register
-    registerPointer = getNextRegisterPointer(registerPointer);
+    writeDataToZ80(getRegisterData(gRegisterPointer));
 }
 
 void loop() {
@@ -441,25 +465,25 @@ void loop() {
         // If register select is set, then set the register pointer at the specified byte index
         if (isRegisterSelectPointer())
         {
-            uint16_t *np = &newRegisterPointer;
+            uint8_t *np = (uint8_t *)&gNewRegisterPointer;
 
             // Reset the new register pointer byte index if receiving the LSB
-            if (newRegisterPointerByteIndex == 0)
+            if (gNewRegisterPointerByteIndex == 0)
             {
                 DBG_PRINTLN("reg ptr LSB set");
-                newRegisterPointer = 0;
+                gNewRegisterPointer = 0;
             }
 
-            np[newRegisterPointerByteIndex] = getDataFromZ80();
-            newRegisterPointerByteIndex++;
+            np[gNewRegisterPointerByteIndex] = getDataFromZ80();
+            gNewRegisterPointerByteIndex++;
 
             // Apply new register pointer value on receiving the MSB
-            if (newRegisterPointerByteIndex >= 2)
+            if (gNewRegisterPointerByteIndex >= 2)
             {
                 DBG_PRINT("reg ptr = ");
-                DBG_PRINTLN(newRegisterPointer, HEX);
-                registerPointer = newRegisterPointer;
-                newRegisterPointerByteIndex = 0;
+                DBG_PRINTLN(gNewRegisterPointer, HEX);
+                gRegisterPointer = gNewRegisterPointer;
+                gNewRegisterPointerByteIndex = 0;
             }
         }
 
@@ -467,35 +491,45 @@ void loop() {
         else
         {
             // Required sequence of operations:
-            uint16_t nextRegisterPointer = getNextRegisterPointer(registerPointer);
 
-            // If next register is STATUS, then don't write it to the Z80. Wait until after the drive operation is complete.
-            if (nextRegisterPointer != REG_ADDR__DRIVE_STATUS)
-            {
-                //   1. Get data at NEXT register pointer address
-                uint8_t data = getRegisterData(nextRegisterPointer);
+            //   Determine next register pointer
+            uint16_t nextRegisterPointer = getNextRegisterPointer(gRegisterPointer);
 
-                //   2. Write data back to Z80 (will overwrite what's in the bus interface if there's data already there)
-                writeDataToZ80(data);
-            }
+            //   Get data at NEXT register pointer address
+            uint8_t data = getRegisterData(nextRegisterPointer);
 
-            //   3. Get Z80 data and write it to the current register pointer (this action will unblock the Z80)
-            setRegisterData(registerPointer, getDataFromZ80());
+            //   Write data at NEXT register back to Z80 (will overwrite what's in the bus interface if there's data already there)
+            writeDataToZ80(data);
 
-            //   4. Move to the next register pointer
-            registerPointer = nextRegisterPointer;
+            //   Get Z80 data and write it to the current register pointer (this action will unblock the Z80)
+            data = getDataFromZ80();
+            setRegisterData(gRegisterPointer, data);
+
+            DBG_PRINT("write to reg ");
+            DBG_PRINT(gRegisterPointer, HEX);
+            DBG_PRINT(": ");
+            DBG_PRINTLN(data, HEX);
+
+            //   Move to the next register pointer
+            gRegisterPointer = nextRegisterPointer;
         }
     }
 
-    // Check if driveOperation is set to something other than NOOP
+    // Check if gDriveOperation is set to something other than NOOP
     // (needs to be in between the write and read Z80 operations)
-    if (driveOperation != _NOOP)
+    if (gDriveOperation != _NOOP)
     {
         // Check drive action parameters
 
-        // Perform drive action
+        // Perform drive action, saving drive operation status
+        DBG_PRINTLN("performing drive operation");
+        gDriveStatus = _NOT_READY;
 
-        // Save drive operation status back into register (will be written back to the waiting Z80 in the next block)
+        // Save drive operation status back to waiting Z80 (it should be waiting for the data from the 
+        writeDataToZ80(gDriveStatus);
+
+        // Reset drive operation back to idle
+        gDriveOperation = _NOOP;
     }
 
     // Request for more data from MCU
@@ -504,15 +538,29 @@ void loop() {
         // If register select is set, then don't reload the bus interface with new data
         if (!isRegisterSelectPointer())
         {
-            // Read data at register pointer and write it onto the bus interface
-            writeDataToZ80(getRegisterData(registerPointer));
+            //   Move to the next register
+            gRegisterPointer = getNextRegisterPointer(gRegisterPointer);
 
-            // Move to the next register
-            registerPointer = getNextRegisterPointer(registerPointer);
+            // Read data at register pointer and write it onto the bus interface
+            uint8_t data = getRegisterData(gRegisterPointer);
+            writeDataToZ80(data);
+
+            DBG_PRINT("read from next reg ");
+            DBG_PRINT(gRegisterPointer, HEX);
+            DBG_PRINT(": ");
+            DBG_PRINTLN(data, HEX);
+            
+
+            // If drive operation is not busy, then move to the next register (allows fast polling of the drive status register)
+            if (gDriveStatus != _BUSY)
+            {
+                // Move to the next register
+                gRegisterPointer = getNextRegisterPointer(gRegisterPointer);
+            }
         }
 
         // Reset the new register pointer byte index
-        newRegisterPointerByteIndex = 0;
+        gNewRegisterPointerByteIndex = 0;
     }
 }
 
