@@ -19,30 +19,35 @@ org $8000
     ; Init
     call    rsInit
 
-    ld      hl, $100
-    call    rsSetRegPtr
+    ; ld      hl, $100
+    ; call    rsSetRegPtr
 
     ; call    iputs
     ; db "  Result: ",0
     ; call    rsReadReg
 
-    ; ; Drive READ
-    ; call    iputs
-    ; db "Drive READ",5,0
-    ; ld      a, 0        ; Drive_A
-    ; ld      b, 1        ; READ
-    ; ld      hl, $123    ; LBA
-    ; call    rsDoDiskOp
-
+    ; Drive READ
+    call    iputs
+    db "Drive READ",5,0
+    ld      a, 0        ; Drive_A
+    ld      b, 1        ; READ
+    ld      hl, $123    ; LBA
+    call    rsDoDiskOp
 
     ; call    hexdump_a
     ; call    iputs
     ; db 5,0
 
-    ; call    iputs
-    ; db "Read full buffer",5,0
-    ; ld      de, buffer
-    ; call    rsReadFullBuffer
+    call    iputs
+    db "Read full buffer",5,0
+    ld      de, buffer
+    call    rsReadFullBuffer
+
+    call    iputs
+    db "Done",5,0
+
+; loop:
+;     jr      loop
 
     jr      exit
 
@@ -101,25 +106,19 @@ rsReadReg:
 ; Set MCU's register pointer
 ;   Params:  HL - New 16-bit register address
 ;   Returns: -
+;   Clobbers: A
 rsSetRegPtr:
     ; Set register select bit (bit 0 of Port C)
-    ; ld      a, $01
+    ; ld      a, $1
     ; out     ($12), a
     ld      a, $01  ; SET bit 0 of Port C
     out     ($13), a
 
-   ld      b, 0
-dly:
-   djnz    dly
-
-    ; Clear cached read data in PPI
-    in      a, ($10)
-
-    ; Wait for data to be cleared in PPI
-; clearVerify:
-;     in      a, ($12)
-;     and     $20
-;     jr      nz, clearVerify
+    ; Wait for register select ACK (bit 0 of Port B)
+waitRegAck:
+    in      a, ($11)
+    and     $01
+    jr      z, waitRegAck
 
     ; Set reg LSB
     ld      a, l
@@ -129,17 +128,20 @@ dly:
     ld      a, h
     call    rsWriteReg
 
+    ; Set dummy (ensures MCU has time to set read data)
+    call    rsWriteReg
+
     ; Clear register select bit
-    ; ld      a, $00
+    ; ld      a, $0
     ; out     ($12), a
     ld      a, $00  ; CLEAR bit 0 of Port C
     out     ($13), a
 
-    ; Wait for data to be set in PPI for new register
-; setVerify:
-;     in      a, ($12)
-;     and     $20
-;     jr      z, setVerify
+    ; Wait for register select de-ACK (bit 0 of Port B)
+waitRegDeAck:
+    in      a, ($11)
+    and     $01
+    jr      nz, waitRegDeAck
 
     ret
 
@@ -195,11 +197,21 @@ rsDoDiskOp:
     ld      a, b
     call    rsWriteReg
 
-    ; Get drive operation result (should wait while busy)
-waitBusy:
+    ; Wait for drive operation to complete
+
+    ;   Wait for MCU to set busy bit
+waitBusy0:
+    in      a, ($11)
+    and     $02
+    jr      z, waitBusy0
+    ;   Wait for MCU to clear busy bit
+waitBusy1:
+    in      a, ($11)
+    and     $02
+    jr      nz, waitBusy1
+
+    ; Get drive status
     call    rsReadReg
-    cp      5
-    jr      z, waitBusy
 
     ret
 

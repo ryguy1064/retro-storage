@@ -39,14 +39,18 @@ RET
 */
 
 // Debug output
-#define DEBUG_ENABLED 1
+#define DEBUG_ENABLED 0
 
 #if DEBUG_ENABLED
 #define DBG_PRINT(...)      Serial.print(__VA_ARGS__)
 #define DBG_PRINTLN(...)    Serial.println(__VA_ARGS__)
 #else
-
+#define DBG_PRINT(...)
+#define DBG_PRINTLN(...)
 #endif
+
+#define INF_PRINT(...)      Serial.print(__VA_ARGS__)
+#define INF_PRINTLN(...)    Serial.println(__VA_ARGS__)
 
 // Pins/ports
 #define BUS_INTERFACE_DATA_OUT      PORTA
@@ -57,6 +61,8 @@ RET
 #define BUS_INTERFACE_OUT_ACK       17
 #define BUS_INTERFACE_OUT_BUFFUL    18
 #define BUS_INTERFACE_REG_SEL       38
+#define BUS_INTERFACE_REG_SEL_ACK   37
+#define BUS_INTERFACE_BUSY          36
 
 #define SET_PIN(port, pinmask) ((port) |= (pinmask))
 #define CLEAR_PIN(port, pinmask) ((port) &= ~(pinmask))
@@ -78,9 +84,17 @@ RET
 #define BUS_INTERFACE_IN_STROBE_port            PORTH
 #define BUS_INTERFACE_IN_STROBE_mask            (1 << 1)
 
-// Z80 -> MCU register select
+// Z80 -> MCU register select (active-high)
 #define BUS_INTERFACE_REG_SEL_port              PIND
 #define BUS_INTERFACE_REG_SEL_mask              (1 << 7)
+
+// MCU -> Z80 register select ACK (active-high)
+#define BUS_INTERFACE_REG_SEL_ACK_port          PORTC
+#define BUS_INTERFACE_REG_SEL_ACK_mask          (1 << 0)
+
+// MCU -> Z80 busy (active-high)
+#define BUS_INTERFACE_BUSY_port                 PORTC
+#define BUS_INTERFACE_BUSY_mask                 (1 << 1)
 
 // Global variables
 static uint16_t gRegisterPointer = 0;
@@ -192,12 +206,14 @@ drive_num_t gDriveSelect = DRIVE_A;
 uint32_t gDriveLBA = 0x00000000;
 drive_operation_t gDriveOperation = _NOOP;
 drive_status_t gDriveStatus = _NO_ERROR;
+bool gIsRegisterSelectAsserted = false;
+uint32_t gTime;
 
 uint8_t gRwBuffer[REG_SIZE__RW_BUFFER] = { 0x00 };
 
 uint8_t gTestSector[REG_SIZE__RW_BUFFER] = { 0x00 };    // Used to test/simulation
 
-inline bool isRegisterSelectPointer()
+inline bool isRegisterSelectPinAsserted()
 {
     return GET_PIN(BUS_INTERFACE_REG_SEL_port, BUS_INTERFACE_REG_SEL_mask);
 }
@@ -410,7 +426,6 @@ void setRegisterData(uint16_t p, uint8_t data)
     // Common parameters
     else if ((p >= REG_ADDR__DRIVE_SELECT) && (p < REG_ADDR__RW_BUFFER))
     {
-        // NOTE: Altering any of these parameters resets the drive status to busy
         switch (p)
         {
         case REG_ADDR__DRIVE_SELECT:
@@ -420,27 +435,27 @@ void setRegisterData(uint16_t p, uint8_t data)
 
         case REG_ADDR__DRIVE_LBA+0:
             gDriveLBA = data;
-            gDriveStatus = _BUSY;
+            // gDriveStatus = _BUSY;
             break;
 
         case REG_ADDR__DRIVE_LBA+1:
             gDriveLBA |= ((uint32_t)data << 8);
-            gDriveStatus = _BUSY;
+            // gDriveStatus = _BUSY;
             break;
 
         case REG_ADDR__DRIVE_LBA+2:
             gDriveLBA |= ((uint32_t)data << 16);
-            gDriveStatus = _BUSY;
+            // gDriveStatus = _BUSY;
             break;
 
         case REG_ADDR__DRIVE_LBA+3:
             gDriveLBA |= ((uint32_t)data << 24);
-            gDriveStatus = _BUSY;
+            // gDriveStatus = _BUSY;
             break;
 
         case REG_ADDR__DRIVE_OPERATION:
             gDriveOperation = (drive_operation_t)data;
-            gDriveStatus = _BUSY;
+            // gDriveStatus = _BUSY;
             break;
 
         case REG_ADDR__DRIVE_STATUS:
@@ -484,12 +499,16 @@ void setup() {
 
     // Initialize Z80 -> MCU register select
     pinMode(BUS_INTERFACE_REG_SEL, INPUT_PULLUP);
+    pinMode(BUS_INTERFACE_REG_SEL_ACK, OUTPUT);
+    digitalWrite(BUS_INTERFACE_REG_SEL_ACK, 0);
 
-#if DEBUG_ENABLED
+    // Initialize busy
+    pinMode(BUS_INTERFACE_BUSY, OUTPUT);
+    digitalWrite(BUS_INTERFACE_BUSY, 0);
+
     Serial.begin(115200);
-#endif
 
-    DBG_PRINTLN("retro-storage v0.1");
+    INF_PRINTLN("retro-storage v0.1");
 
     // Prime the first register data
     //   Read data at register pointer and write it onto the bus interface
@@ -503,11 +522,32 @@ void setup() {
 }
 
 void loop() {
+    // Check for register select assertion
+    if (isRegisterSelectPinAsserted() && !gIsRegisterSelectAsserted)
+    {
+        gIsRegisterSelectAsserted = true;
+        gNewRegisterPointerByteIndex = 0;
+
+        // Signal register select ACK
+        SET_PIN(BUS_INTERFACE_REG_SEL_ACK_port, BUS_INTERFACE_REG_SEL_ACK_mask);
+
+        DBG_PRINTLN("Register select asserted");
+    }
+    else if (!isRegisterSelectPinAsserted() && gIsRegisterSelectAsserted)
+    {
+        gIsRegisterSelectAsserted = false;
+
+        // Signal register select de-ACK
+        CLEAR_PIN(BUS_INTERFACE_REG_SEL_ACK_port, BUS_INTERFACE_REG_SEL_ACK_mask);
+
+        DBG_PRINTLN("Register select deasserted");
+    }
+
     // Received data from Z80
     if (isZ80WriteDataAvailable())
     {
         // If register select is set, then set the register pointer at the specified byte index
-        if (isRegisterSelectPointer())
+        if (gIsRegisterSelectAsserted)
         {
             // Get byte from PPI
             uint8_t data = getDataFromZ80();
@@ -518,7 +558,7 @@ void loop() {
                 DBG_PRINT("reg ptr LSB set to ");
                 DBG_PRINTLN(data, HEX);
                 gNewRegisterPointer = data;
-                gNewRegisterPointerByteIndex = 1;
+                gNewRegisterPointerByteIndex++;
             }
 
             // Set MSB
@@ -531,10 +571,16 @@ void loop() {
                 DBG_PRINT("reg ptr = ");
                 DBG_PRINTLN(gNewRegisterPointer, HEX);
                 gRegisterPointer = gNewRegisterPointer;
-                gNewRegisterPointerByteIndex = 0;
+                gNewRegisterPointerByteIndex++;
 
                 // Prime the register data
                 writeDataToZ80(getRegisterData(gRegisterPointer));
+            }
+
+            // All further bytes are ignored (can be used by Z80 to ensure register read data is valid for new register pointer)
+            else
+            {
+                 DBG_PRINTLN("reg ptr dummy");
             }
         }
 
@@ -569,6 +615,10 @@ void loop() {
     // Check if gDriveOperation is set to something other than NOOP
     if (gDriveOperation != _NOOP)
     {
+        // Set busy
+        SET_PIN(BUS_INTERFACE_BUSY_port, BUS_INTERFACE_BUSY_mask);
+        gDriveStatus = _BUSY;
+
         // Check drive action parameters
 
         // Perform drive action, saving drive operation status (NOTE: status was already set to busy earlier)
@@ -577,46 +627,49 @@ void loop() {
         switch (gDriveOperation)
         {
         case _READ:
-            DBG_PRINT("SIM: reading from drive...");
+            INF_PRINT("SIM: reading from drive...");
             memcpy(gRwBuffer, gTestSector, sizeof(gTestSector));
             gDriveStatus = _NO_ERROR;
             break;
 
         case _WRITE:
-            DBG_PRINT("SIM: writing to drive...");
+            INF_PRINT("SIM: writing to drive...");
             memcpy(gTestSector, gRwBuffer, sizeof(gTestSector));
             gDriveStatus = _NO_ERROR;
             break;
 
         case _FORMAT:
-            DBG_PRINT("SIM: formatting drive...");
+            INF_PRINT("SIM: formatting drive...");
             memset(gTestSector, 0xEE, sizeof(gTestSector));
             gDriveStatus = _NO_ERROR;
             break;
 
         case _RESET:
-            DBG_PRINT("SIM: resetting drive...");
+            INF_PRINT("SIM: resetting drive...");
             gDriveStatus = _NO_ERROR;
             break;
 
         default:
-            DBG_PRINTLN("SIM: invalid drive operation");
+            INF_PRINTLN("SIM: invalid drive operation");
             break;
         }
 
-        #define SIM_DRIVE_OP_TIME_SEC 10
+        #define SIM_DRIVE_OP_TIME_SEC 3
         for (uint8_t i = 0; i < SIM_DRIVE_OP_TIME_SEC; i++)
         {
-            DBG_PRINT((SIM_DRIVE_OP_TIME_SEC-i));
-            DBG_PRINT(" ");
+            INF_PRINT((SIM_DRIVE_OP_TIME_SEC-i));
+            INF_PRINT(" ");
             delay(1000);
         }
-        DBG_PRINTLN("done");
+        INF_PRINTLN("done");
 
         // --- END SIMULATION ---
 
-        // Save drive operation status back to waiting Z80 (it should be waiting for the data)
+        // Save drive operation status so Z80 will read it when un-busied
         writeDataToZ80(gDriveStatus);
+
+        // Clear busy (Z80 should be waiting for this to clear)
+        CLEAR_PIN(BUS_INTERFACE_BUSY_port, BUS_INTERFACE_BUSY_mask);
 
         // Reset drive operation back to idle
         gDriveOperation = _NOOP;
@@ -627,7 +680,7 @@ void loop() {
     {
         // Clear data from PPI if register select is set
         // (don't reload the bus interface with new data)
-        if (isRegisterSelectPointer())
+        if (gIsRegisterSelectAsserted)
         {
             DBG_PRINTLN("Clear data from PPI");
 
@@ -641,24 +694,32 @@ void loop() {
             DBG_PRINT("Z80 read from reg ");
             DBG_PRINTLN(gRegisterPointer, HEX);
 
-            // If drive operation is not busy, then move to the next register (allows fast polling of the drive status register)
-            if (gDriveStatus != _BUSY)
+            // Performance measurement
+            if (gRegisterPointer == (REG_ADDR__RW_BUFFER + REG_SIZE__RW_BUFFER - 1))
             {
-                // Move to the next register
-                gRegisterPointer = getNextRegisterPointer(gRegisterPointer);
+                uint32_t totalTime = micros() - gTime;
+
+                INF_PRINT("Full buffer read time (us): ");
+                INF_PRINTLN(totalTime);
             }
 
-            // Read data at register pointer and write it onto the bus interface
+            // Move to the next register
+            gRegisterPointer = getNextRegisterPointer(gRegisterPointer);
+
+            // Read data at NEXT register pointer and write it onto the bus interface
             uint8_t data = getRegisterData(gRegisterPointer);
             writeDataToZ80(data);
+
+            // Performance measurement
+            if (gRegisterPointer-1 == REG_ADDR__RW_BUFFER)
+            {
+                gTime = micros();
+            }
 
             DBG_PRINT("read from next reg ");
             DBG_PRINT(gRegisterPointer, HEX);
             DBG_PRINT(": ");
             DBG_PRINTLN(data, HEX);
-
-            // Reset the new register pointer byte index
-            gNewRegisterPointerByteIndex = 0;
         }
     }
 }
