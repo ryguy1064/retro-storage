@@ -1,4 +1,7 @@
 #include <Arduino.h>
+#include "ArduinoFDC.h"
+#include "ArduDOS.h"
+#include "sectorSkew.h"
 
 // -----------------------------------------------------------------
 // 82C55 settings:
@@ -39,7 +42,15 @@ RET
 */
 
 // Debug output
-#define DEBUG_ENABLED 0
+#define INFO_ENABLED        1
+#define DEBUG_ENABLED       0
+#define VERBOSE_ENABLED     0
+
+// Drive simulation
+#define DRIVE_SIM 0
+
+// Buffer R/W performance measurement
+#define PERF_MEAS 0
 
 #if DEBUG_ENABLED
 #define DBG_PRINT(...)      Serial.print(__VA_ARGS__)
@@ -49,8 +60,25 @@ RET
 #define DBG_PRINTLN(...)
 #endif
 
+#if VERBOSE_ENABLED
+#define VRB_PRINT(...)      Serial.print(__VA_ARGS__)
+#define VRB_PRINTLN(...)    Serial.println(__VA_ARGS__)
+#else
+#define VRB_PRINT(...)
+#define VRB_PRINTLN(...)
+#endif
+
+#if INFO_ENABLED
 #define INF_PRINT(...)      Serial.print(__VA_ARGS__)
 #define INF_PRINTLN(...)    Serial.println(__VA_ARGS__)
+#else
+#define INF_PRINT(...)
+#define INF_PRINTLN(...)
+#endif
+
+#define DISK_MOTOR_IDLE_TIMEOUT_MS  4000
+
+#define DEFAULT_SECTOR_SKEW 1
 
 // Pins/ports
 #define BUS_INTERFACE_DATA_OUT      PORTA
@@ -112,13 +140,14 @@ static uint8_t gNewRegisterPointerByteIndex = 0;
 //   0x0: Default drive properties (read from HW jumpers) (0 = None, 1 = 5.25" DD, 2 = 5.25" DD in HD drive, 3 = 5.25" HD, 4 = 3.5" DD, 5 = 3.5" HD)
 //   0x1: Configured drive properties (overrides default)
 //   0x2 - 0x5: Max LBA (512-byte sectors)
-//   0x6 - 0xf: Reserved (0x00)
+//   0x6: Sector skew (within a track) (0-1 = 1 sector, 2 = 2 sectors, 3 = 3 sectors, etc...)
+//   0x7 - 0xf: Reserved (0x00)
 //
 // Common parameters
 // 0x040: Drive select (0 = Drive A, 1 = Drive B, 2 = Drive C, 3 = Drive D)
 // 0x041 - 0x044: Drive LBA (0x00000000 - 0xFFFFFFFF)
 // 0x045: Drive operation (0 = Controller reset, 1 = Read sector from drive into buffer, 2 = Write sector to drive from buffer, 3 = Format (floppy: low-level))
-// 0x046: Drive status (0 = No error, 1 = Invalid param, 2 = Write-protected, 3 = Read/write error, 4 = Not ready, 5 = Busy, 6 = Timeout)
+// 0x046: Drive status (0 = No error/Operation complete, 1 = Invalid param, 2 = Write-protected, 3 = Read/write error, 4 = Not ready, 5 = Busy, 6 = Timeout)
 // 0x047 - 0x0FF: Reserved (0x00)
 //
 // R/W Buffer
@@ -139,7 +168,8 @@ static uint8_t gNewRegisterPointerByteIndex = 0;
 #define REG_ADDR__DRIVE_PROPERTY_DEFAULT 0x000
 #define REG_ADDR__DRIVE_PROPERTY_CONFIGURED 0x001
 #define REG_ADDR__DRIVE_PROPERTY_MAX_LBA 0x002
-#define REG_ADDR__DRIVE_PROPERTY_RESERVED 0x006
+#define REG_ADDR__DRIVE_PROPERTY_SECTOR_SKEW 0x006
+#define REG_ADDR__DRIVE_PROPERTY_RESERVED 0x007
 
 #define REG_ADDR__DRIVE_SELECT 0x040
 #define REG_ADDR__DRIVE_LBA 0x041
@@ -154,7 +184,8 @@ typedef enum
     DRIVE_A = 0,
     DRIVE_B = 1,
     DRIVE_C = 2,
-    DRIVE_D = 3
+    DRIVE_D = 3,
+    DRIVE_MAX
 } drive_num_t;
 
 typedef enum
@@ -187,19 +218,30 @@ typedef enum
     _3_5_HD = 5
 } drive_type_t;
 
+const ArduinoFDCClass::DriveType cRSToArduinoFDCDriveTypeMap[] =
+{
+    ArduinoFDCClass::DT_5_DD,
+    ArduinoFDCClass::DT_5_DD,
+    ArduinoFDCClass::DT_5_DDonHD,
+    ArduinoFDCClass::DT_5_HD,
+    ArduinoFDCClass::DT_3_DD,
+    ArduinoFDCClass::DT_3_HD
+};
+
 typedef struct
 {
     drive_type_t def;
     drive_type_t configured;
     uint32_t maxLBA;
+    uint8_t sectorSkew;
 } drive_properties_t;
 
 drive_properties_t gDriveProperties[4] = 
 {
-    { _3_5_HD, _3_5_HD, (1440UL*1024/512) },
-    { _5_25_DD_in_HD_drive, _5_25_DD_in_HD_drive, (320UL*1024/512) },
-    { _NONE, _NONE, 0x00000000 },
-    { _NONE, _NONE, 0x00000000 }
+    { _3_5_HD, _3_5_HD, (1440UL*1024/512), 2 },
+    { _5_25_DD_in_HD_drive, _5_25_DD_in_HD_drive, (360UL*1024/512), 2 },
+    { _NONE, _NONE, 0x00000000, 0 },
+    { _NONE, _NONE, 0x00000000, 0 }
 };
 
 drive_num_t gDriveSelect = DRIVE_A;
@@ -207,11 +249,18 @@ uint32_t gDriveLBA = 0x00000000;
 drive_operation_t gDriveOperation = _NOOP;
 drive_status_t gDriveStatus = _NO_ERROR;
 bool gIsRegisterSelectAsserted = false;
+uint32_t gDiskMotorStartTime;
+
+uint8_t gFdcBuffer[516] = { 0x00 };
+uint8_t *gRwBuffer = &gFdcBuffer[1];
+
+#if DRIVE_SIM
+uint8_t gTestSector[516] = { 0x00 };    // Used for test/simulation
+#endif
+
+#if PERF_MEAS
 uint32_t gTime;
-
-uint8_t gRwBuffer[REG_SIZE__RW_BUFFER] = { 0x00 };
-
-uint8_t gTestSector[REG_SIZE__RW_BUFFER] = { 0x00 };    // Used to test/simulation
+#endif
 
 inline bool isRegisterSelectPinAsserted()
 {
@@ -274,7 +323,10 @@ inline uint8_t getDataFromZ80()
     {
         noInterrupts();
         CLEAR_PIN(BUS_INTERFACE_OUT_ACK_port, BUS_INTERFACE_OUT_ACK_mask);
-        delayMicroseconds(2);   // Allow PPI time to output data on Port A (MCU is too fast without this delay)
+        // Allow PPI time to output data on Port A (MCU is too fast without this delay)
+        __asm__ __volatile__ (
+        "nop" "\n\t"
+        "nop"); // 2 cycles
         b = (uint8_t)BUS_INTERFACE_DATA_IN;
         SET_PIN(BUS_INTERFACE_OUT_ACK_port, BUS_INTERFACE_OUT_ACK_mask);
         interrupts();
@@ -315,31 +367,36 @@ uint8_t getRegisterData(uint16_t p)
     {
         drive_num_t drive = (drive_num_t)((p & REG_ADDR__DRIVE_NUM_MASK) >> REG_ADDR__DRIVE_NUM_SHIFT);
         uint8_t property = (p & REG_ADDR__DRIVE_PROPERTY_MASK);
+        drive_properties_t *propertyData = &gDriveProperties[drive];
 
         switch (property)
         {
         case REG_ADDR__DRIVE_PROPERTY_DEFAULT:
-            data = (uint8_t)gDriveProperties[drive].def;
+            data = (uint8_t)propertyData->def;
             break;
 
         case REG_ADDR__DRIVE_PROPERTY_CONFIGURED:
-            data = (uint8_t)gDriveProperties[drive].configured;
+            data = (uint8_t)propertyData->configured;
             break;
 
         case REG_ADDR__DRIVE_PROPERTY_MAX_LBA+0:
-            data = (uint8_t)((gDriveProperties[drive].maxLBA & 0x000000FF) >> 0);
+            data = (uint8_t)((propertyData->maxLBA & 0x000000FF) >> 0);
             break;
 
         case REG_ADDR__DRIVE_PROPERTY_MAX_LBA+1:
-            data = (uint8_t)((gDriveProperties[drive].maxLBA & 0x0000FF00) >> 8);
+            data = (uint8_t)((propertyData->maxLBA & 0x0000FF00) >> 8);
             break;
 
         case REG_ADDR__DRIVE_PROPERTY_MAX_LBA+2:
-            data = (uint8_t)((gDriveProperties[drive].maxLBA & 0x00FF0000) >> 16);
+            data = (uint8_t)((propertyData->maxLBA & 0x00FF0000) >> 16);
             break;
 
         case REG_ADDR__DRIVE_PROPERTY_MAX_LBA+3:
-            data = (uint8_t)((gDriveProperties[drive].maxLBA & 0xFF000000) >> 24);
+            data = (uint8_t)((propertyData->maxLBA & 0xFF000000) >> 24);
+
+        case REG_ADDR__DRIVE_PROPERTY_SECTOR_SKEW:
+            data = propertyData->sectorSkew;
+            break;
 
         default:
             data = 0;
@@ -408,14 +465,17 @@ void setRegisterData(uint16_t p, uint8_t data)
     {
         drive_num_t drive = (drive_num_t)((p & REG_ADDR__DRIVE_NUM_MASK) >> REG_ADDR__DRIVE_NUM_SHIFT);
         uint8_t property = (p & REG_ADDR__DRIVE_PROPERTY_MASK);
+        drive_properties_t *propertyData = &gDriveProperties[drive];
 
         switch (property)
         {
         case REG_ADDR__DRIVE_PROPERTY_CONFIGURED:
-        {
-            gDriveProperties[drive].configured = (drive_type_t)data;
+            propertyData->configured = (drive_type_t)data;
             break;
-        }
+
+        case REG_ADDR__DRIVE_PROPERTY_SECTOR_SKEW:
+            propertyData->sectorSkew = data;
+            break;
 
         default:
             // Do nothing
@@ -476,6 +536,44 @@ void setRegisterData(uint16_t p, uint8_t data)
     }
 }
 
+// RJW: This mapping matches standard Floppies formatted in Windows (when no skew is used)
+void lbaToTrackSector(uint16_t targetLba, uint8_t *diskTrack, uint8_t *diskSide, uint8_t *diskSector, uint8_t sectorSkew)
+{
+    uint8_t numSectors = ArduinoFDC.numSectors();
+    uint8_t numSectorsX2 = numSectors * 2;
+
+    *diskSide = 0;
+    *diskTrack = targetLba / numSectorsX2;
+    *diskSector = targetLba % numSectorsX2;
+    if (*diskSector >= numSectors)
+    {
+        *diskSide = 1;
+        *diskSector -= numSectors;
+    }
+    *diskSector += 1;
+
+    #if 0
+    // Provide sector skew for performance
+    const uint8_t skewMap1[]  = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18};
+    const uint8_t skewMap2[]  = {1, 3, 5, 7, 9, 11, 13, 15, 17, 2, 4, 6, 8, 10, 12, 14, 16, 18};
+    const uint8_t skewMap3[]  = {1, 4, 7, 10, 13, 16, 2, 5, 8, 11, 14, 17, 3, 6, 9, 12, 15, 18};
+    const uint8_t skewMap6[]  = {1, 7, 13, 2, 8, 14, 3, 9, 15, 4, 10, 16, 5, 11, 17, 6, 12, 18};
+    const uint8_t skewMap12[] = {1, 13, 8, 3, 15, 10, 5, 17, 12, 7, 2, 14, 9, 4, 16, 11, 6, 18};
+    const uint8_t skewMap13[] = {1, 14, 10, 6, 2, 15, 11, 7, 3, 16, 12, 8, 4, 17, 13, 9, 5, 18};
+    const uint8_t *chosenSkewMap = skewMap2;
+    *diskSector = chosenSkewMap[(*diskSector)-1];
+    #else
+    performSectorSkew(diskSector, sectorSkew, numSectors);
+    #endif
+
+    INF_PRINT(F(" -> CHS: "));
+    INF_PRINT(*diskTrack);
+    INF_PRINT(' ');
+    INF_PRINT(*diskSide);
+    INF_PRINT(' ');
+    INF_PRINT(*diskSector);
+}
+
 /**
  * @brief Initializes the bus interface between the MCU and Z80 processor.
  * 
@@ -508,20 +606,58 @@ void setup() {
 
     Serial.begin(115200);
 
+    delayMicroseconds(2);
+
     INF_PRINTLN("retro-storage v0.1");
 
     // Prime the first register data
     //   Read data at register pointer and write it onto the bus interface
     writeDataToZ80(getRegisterData(gRegisterPointer));
 
+#if DRIVE_SIM
     // Populate test sector
     for (uint16_t i = 0; i < sizeof(gTestSector); i++)
     {
         gTestSector[i] = i;
     }
+#else
+    // Initialize ArduinoFDC
+    ArduinoFDC.begin(
+        cRSToArduinoFDCDriveTypeMap[gDriveProperties[0].def],
+        cRSToArduinoFDCDriveTypeMap[gDriveProperties[1].def]);
+#endif
+
+    // // Print current contents of gDriveProperties
+    // for (uint8_t i = 0; i < 4; i++)
+    // {
+    //     DBG_PRINT("Drive ");
+    //     DBG_PRINT(i);
+    //     DBG_PRINT(": ");
+    //     DBG_PRINT(gDriveProperties[i].def);
+    //     DBG_PRINT(" ");
+    //     DBG_PRINT(gDriveProperties[i].configured);
+    //     DBG_PRINT(" ");
+    //     DBG_PRINTLN(gDriveProperties[i].maxLBA);
+    // }
 }
 
+uint32_t gLastTime = 0;
+String serialCmd;
+
 void loop() {
+    if (Serial.available())
+    {
+        // Serial.println("Char detected");
+        serialCmd = Serial.readString();
+        Serial.println(serialCmd);
+        serialCmd.trim();
+        if (serialCmd == "dos")
+        {
+        Serial.println(F("Entering ArduDOS"));
+        arduDOS();
+        }
+    }
+
     // Check for register select assertion
     if (isRegisterSelectPinAsserted() && !gIsRegisterSelectAsserted)
     {
@@ -531,7 +667,7 @@ void loop() {
         // Signal register select ACK
         SET_PIN(BUS_INTERFACE_REG_SEL_ACK_port, BUS_INTERFACE_REG_SEL_ACK_mask);
 
-        DBG_PRINTLN("Register select asserted");
+        VRB_PRINTLN("Register select asserted");
     }
     else if (!isRegisterSelectPinAsserted() && gIsRegisterSelectAsserted)
     {
@@ -540,7 +676,7 @@ void loop() {
         // Signal register select de-ACK
         CLEAR_PIN(BUS_INTERFACE_REG_SEL_ACK_port, BUS_INTERFACE_REG_SEL_ACK_mask);
 
-        DBG_PRINTLN("Register select deasserted");
+        VRB_PRINTLN("Register select deasserted");
     }
 
     // Received data from Z80
@@ -555,8 +691,8 @@ void loop() {
             // Set LSB
             if (gNewRegisterPointerByteIndex == 0)
             {
-                DBG_PRINT("reg ptr LSB set to ");
-                DBG_PRINTLN(data, HEX);
+                VRB_PRINT("reg ptr LSB set to ");
+                VRB_PRINTLN(data, HEX);
                 gNewRegisterPointer = data;
                 gNewRegisterPointerByteIndex++;
             }
@@ -565,11 +701,11 @@ void loop() {
             else if (gNewRegisterPointerByteIndex == 1)
             {
                 gNewRegisterPointer |= (uint16_t)data << 8;
-                DBG_PRINT("reg ptr MSB set to ");
-                DBG_PRINTLN(data, HEX);
+                VRB_PRINT("reg ptr MSB set to ");
+                VRB_PRINTLN(data, HEX);
 
-                DBG_PRINT("reg ptr = ");
-                DBG_PRINTLN(gNewRegisterPointer, HEX);
+                VRB_PRINT("reg ptr = ");
+                VRB_PRINTLN(gNewRegisterPointer, HEX);
                 gRegisterPointer = gNewRegisterPointer;
                 gNewRegisterPointerByteIndex++;
 
@@ -580,7 +716,7 @@ void loop() {
             // All further bytes are ignored (can be used by Z80 to ensure register read data is valid for new register pointer)
             else
             {
-                 DBG_PRINTLN("reg ptr dummy");
+                VRB_PRINTLN("reg ptr dummy");
             }
         }
 
@@ -602,74 +738,205 @@ void loop() {
             data = getDataFromZ80();
             setRegisterData(gRegisterPointer, data);
 
-            DBG_PRINT("write to reg ");
-            DBG_PRINT(gRegisterPointer, HEX);
-            DBG_PRINT(": ");
-            DBG_PRINTLN(data, HEX);
+            VRB_PRINT("write to reg ");
+            VRB_PRINT(gRegisterPointer, HEX);
+            VRB_PRINT(": ");
+            VRB_PRINTLN(data, HEX);
 
             //   Move to the next register pointer
             gRegisterPointer = nextRegisterPointer;
         }
     }
 
-    // Check if gDriveOperation is set to something other than NOOP
+    // Perform drive operartion if it's set to something other than NOOP
     if (gDriveOperation != _NOOP)
     {
+        gLastTime = micros();
+
         // Set busy
         SET_PIN(BUS_INTERFACE_BUSY_port, BUS_INTERFACE_BUSY_mask);
         gDriveStatus = _BUSY;
 
-        // Check drive action parameters
-
-        // Perform drive action, saving drive operation status (NOTE: status was already set to busy earlier)
-
-        // --- SIMULATION ---
-        switch (gDriveOperation)
+        do
         {
-        case _READ:
-            INF_PRINT("SIM: reading from drive...");
-            memcpy(gRwBuffer, gTestSector, sizeof(gTestSector));
-            gDriveStatus = _NO_ERROR;
-            break;
+        #if !DRIVE_SIM
+            byte fdcStatus = _NOT_READY;
+            uint8_t track, sector, side;
+        #endif
 
-        case _WRITE:
-            INF_PRINT("SIM: writing to drive...");
-            memcpy(gTestSector, gRwBuffer, sizeof(gTestSector));
-            gDriveStatus = _NO_ERROR;
-            break;
+            // Select drive
+            if (gDriveSelect == DRIVE_A)
+            {
+                ArduinoFDC.selectDrive(0);
+                ArduinoFDC.setDriveType(cRSToArduinoFDCDriveTypeMap[gDriveProperties[0].configured]);
+            }
+            else if (gDriveSelect == DRIVE_B)
+            {
+                ArduinoFDC.selectDrive(1);
+                ArduinoFDC.setDriveType(cRSToArduinoFDCDriveTypeMap[gDriveProperties[1].configured]);
+            }
+            else
+            {
+                gDriveStatus = _INVALID_PARAM;
+                break;
+            }
 
-        case _FORMAT:
-            INF_PRINT("SIM: formatting drive...");
-            memset(gTestSector, 0xEE, sizeof(gTestSector));
-            gDriveStatus = _NO_ERROR;
-            break;
+            // Check drive read/write action parameters
+            if (gDriveOperation == _READ || gDriveOperation == _WRITE)
+            {
+                //   Drive select
+                if (gDriveSelect >= DRIVE_MAX)
+                {
+                    INF_PRINTLN("Invalid drive select");
+                    gDriveStatus = _INVALID_PARAM;
+                    break;
+                }
 
-        case _RESET:
-            INF_PRINT("SIM: resetting drive...");
-            gDriveStatus = _NO_ERROR;
-            break;
+                //   LBA
+                if (gDriveLBA >= gDriveProperties[gDriveSelect].maxLBA)
+                {
+                    INF_PRINT("Invalid LBA ");
+                    INF_PRINTLN(gDriveLBA);
+                    gDriveStatus = _INVALID_PARAM;
+                    break;
+                }
+            }
 
-        default:
-            INF_PRINTLN("SIM: invalid drive operation");
-            break;
-        }
+            // Turn on motor early to avoid delay in ArduinoFDC code
+            gDiskMotorStartTime = millis();
+            ArduinoFDC.motorOn();
 
-        #define SIM_DRIVE_OP_TIME_SEC 3
-        for (uint8_t i = 0; i < SIM_DRIVE_OP_TIME_SEC; i++)
-        {
-            INF_PRINT((SIM_DRIVE_OP_TIME_SEC-i));
-            INF_PRINT(" ");
-            delay(1000);
-        }
-        INF_PRINTLN("done");
+            // Check drive write protection
+            if ((gDriveOperation == _WRITE) || (gDriveOperation == _FORMAT))
+            {
+                if (ArduinoFDC.isWriteProtected())
+                {
+                    INF_PRINTLN("Write protected");
+                    gDriveStatus = _WRITE_PROTECTED;
+                    break;
+                }
+            }
 
-        // --- END SIMULATION ---
+            // Perform drive action, saving drive operation status (NOTE: status was already set to busy earlier)
+            INF_PRINT("DRIVE ");
+            INF_PRINT(gDriveSelect);
+            INF_PRINT(" OP: ");
+            switch (gDriveOperation)
+            {
+            case _READ:
+            #if DRIVE_SIM
+                INF_PRINT("SIM: reading from drive...");
+                memcpy(gRwBuffer, gTestSector, sizeof(gTestSector));
+                gDriveStatus = _NO_ERROR;
+            #else
+                INF_PRINT("READ LBA ");
+                INF_PRINT(gDriveLBA);
+                lbaToTrackSector(gDriveLBA, &track, &side, &sector, gDriveProperties[gDriveSelect].sectorSkew);
+                fdcStatus = ArduinoFDC.readSector(track, side, sector, gFdcBuffer);
+            #endif
+                break;
+
+            case _WRITE:
+            #if DRIVE_SIM
+                INF_PRINT("SIM: writing to drive...");
+                memcpy(gTestSector, gRwBuffer, sizeof(gTestSector));
+                gDriveStatus = _NO_ERROR;
+            #else
+                INF_PRINT("WRITE LBA ");
+                INF_PRINT(gDriveLBA);
+                lbaToTrackSector(gDriveLBA, &track, &side, &sector, gDriveProperties[gDriveSelect].sectorSkew);
+                fdcStatus = ArduinoFDC.writeSector(track, side, sector, gFdcBuffer, false);
+            #endif
+                break;
+
+            case _FORMAT:
+            #if DRIVE_SIM
+                INF_PRINT("SIM: formatting drive...");
+                memset(gTestSector, 0xEE, sizeof(gTestSector));
+                gDriveStatus = _NO_ERROR;
+            #else
+                INF_PRINT("FORMAT ");
+                fdcStatus = ArduinoFDC.formatDisk(gFdcBuffer);
+            #endif
+                break;
+
+            case _RESET:
+            #if DRIVE_SIM
+                INF_PRINT("SIM: resetting drive...");
+                gDriveStatus = _NO_ERROR;
+            #else
+                // Nothing to do
+                INF_PRINT("RESET ");
+                gDriveStatus = _NO_ERROR;
+            #endif
+                break;
+
+            default:
+            #if DRIVE_SIM
+                INF_PRINTLN("SIM: invalid drive operation");
+            #else
+                INF_PRINT("invalid drive operation ");
+            #endif
+                break;
+            }
+
+        #if DRIVE_SIM
+            #define SIM_DRIVE_OP_TIME_SEC 3
+            for (uint8_t i = 0; i < SIM_DRIVE_OP_TIME_SEC; i++)
+            {
+                INF_PRINT((SIM_DRIVE_OP_TIME_SEC-i));
+                INF_PRINT(" ");
+                delay(1000);
+            }
+        #else
+            if (fdcStatus != S_OK)
+            {
+                INF_PRINT(" FDC status: ");
+                INF_PRINT(fdcStatus);
+            }
+
+            // Convert ArduinoFDC status to drive status
+            switch (fdcStatus)
+            {
+            case S_OK:
+                gDriveStatus = _NO_ERROR;
+                break;
+
+            case S_NOTINIT:
+            case S_NOTREADY:
+                gDriveStatus = _NOT_READY;
+                break;
+
+            case S_NOSYNC:
+            case S_NOHEADER:
+            case S_INVALIDID:
+            case S_CRC:
+            case S_NOTRACK0:
+            case S_VERIFY:
+                gDriveStatus = _READ_WRITE_ERROR;
+                break;
+
+            case S_READONLY:
+                gDriveStatus = _WRITE_PROTECTED;
+                break;
+
+            default:
+                gDriveStatus = _NOT_READY;
+                break;
+            }
+        #endif
+
+            INF_PRINT(" Done");
+        } while (0);
 
         // Save drive operation status so Z80 will read it when un-busied
         writeDataToZ80(gDriveStatus);
 
         // Clear busy (Z80 should be waiting for this to clear)
         CLEAR_PIN(BUS_INTERFACE_BUSY_port, BUS_INTERFACE_BUSY_mask);
+
+        INF_PRINT(" *");
+        INF_PRINTLN(micros() - gLastTime);
 
         // Reset drive operation back to idle
         gDriveOperation = _NOOP;
@@ -682,7 +949,7 @@ void loop() {
         // (don't reload the bus interface with new data)
         if (gIsRegisterSelectAsserted)
         {
-            DBG_PRINTLN("Clear data from PPI");
+            VRB_PRINTLN("Clear data from PPI");
 
             // Reset the new register pointer byte index
             gNewRegisterPointerByteIndex = 0;
@@ -691,17 +958,19 @@ void loop() {
         // Otherwise, get data at next register pointer address and write it onto the bus interface
         else
         {
-            DBG_PRINT("Z80 read from reg ");
-            DBG_PRINTLN(gRegisterPointer, HEX);
+            VRB_PRINT("Z80 read from reg ");
+            VRB_PRINTLN(gRegisterPointer, HEX);
 
+        #if PERF_MEAS
             // Performance measurement
             if (gRegisterPointer == (REG_ADDR__RW_BUFFER + REG_SIZE__RW_BUFFER - 1))
             {
                 uint32_t totalTime = micros() - gTime;
 
-                INF_PRINT("Full buffer read time (us): ");
-                INF_PRINTLN(totalTime);
+                DBG_PRINT("Full buffer read time (us): ");
+                DBG_PRINTLN(totalTime);
             }
+        #endif
 
             // Move to the next register
             gRegisterPointer = getNextRegisterPointer(gRegisterPointer);
@@ -710,84 +979,25 @@ void loop() {
             uint8_t data = getRegisterData(gRegisterPointer);
             writeDataToZ80(data);
 
+        #if PERF_MEAS
             // Performance measurement
             if (gRegisterPointer-1 == REG_ADDR__RW_BUFFER)
             {
                 gTime = micros();
             }
+        #endif
 
-            DBG_PRINT("read from next reg ");
-            DBG_PRINT(gRegisterPointer, HEX);
-            DBG_PRINT(": ");
-            DBG_PRINTLN(data, HEX);
+            VRB_PRINT("read from next reg ");
+            VRB_PRINT(gRegisterPointer, HEX);
+            VRB_PRINT(": ");
+            VRB_PRINTLN(data, HEX);
         }
     }
-}
 
-#if 0
-        uint8_t b;
-
-        // Serial.print("Count: "); Serial.print(count);
-        // Serial.print(" Bus: "); Serial.print((uint8_t)BUS_INTERFACE_DATA_IN, HEX); Serial.print(" IN_BUFFUL "); Serial.print(digitalRead(BUS_INTERFACE_IN_BUFFUL));
-        // Serial.print(" OUT_BUFFUL "); Serial.print(!digitalRead(BUS_INTERFACE_OUT_BUFFUL)); Serial.print(" REG_SEL "); Serial.print(digitalRead(BUS_INTERFACE_REG_SEL));
-        // Serial.println();
-
-        // delay(5000);
-
-        // Serial.println("OUT_ACK 0");
-
-        // THIS SECTION IS TIMING CRITICAL! IT MUST COMPLETE AS FAST AS POSSIBLE!
-        {
-            // Get byte from 82C55A
-            noInterrupts();
-            CLEAR_PIN(BUS_INTERFACE_OUT_ACK_port, BUS_INTERFACE_OUT_ACK_mask);
-            // delayMicroseconds(10);
-            // delay(5000);
-            b = (uint8_t)BUS_INTERFACE_DATA_IN;
-            // Serial.print("  Received data from Z80: "); Serial.println(b, HEX);
-            // delay(5000);
-            // Serial.println("OUT_ACK 1");
-            SET_PIN(BUS_INTERFACE_OUT_ACK_port, BUS_INTERFACE_OUT_ACK_mask);
-            interrupts();
-        }
-
-        if (prevByte != b)
-        {
-            errors++;
-        }
-        prevByte = (b+1) & 0xFF;
-
-        // Save timestamp when data is 0x00
-        if (b == 0x00) {
-            if (count == 0)
-            {
-                uint32_t now = millis();
-                if (timestamp != 0)
-                {
-                    // Print delta millis from last time
-                    Serial.print("Time for 64KB: "); Serial.print(now - timestamp, DEC); Serial.print(" ms (");
-                    Serial.print((uint32_t)(65536*1000)/(now-timestamp), DEC); Serial.print(" bytes/s)  Errors: "); Serial.println(errors, DEC);
-                }
-                timestamp = now;
-            }
-            count++;
-        }
-
-        // delay(2000);
-
-        // Send a byte back to the Z80
-        // b++;
-        // // Serial.print("  Send data+1 back to the Z80: "); Serial.println(b, HEX);
-        // BUS_INTERFACE_DATA_DDR = 0xFF;
-        // BUS_INTERFACE_DATA_OUT = b;
-        // digitalWrite(BUS_INTERFACE_IN_STROBE, 0);
-        // digitalWrite(BUS_INTERFACE_IN_STROBE, 1);
-        // BUS_INTERFACE_DATA_DDR = 0x00;
-
-        // count++;
+    // Turn off disk motor after idle timeout
+    if (ArduinoFDC.motorRunning() && ((millis() - gDiskMotorStartTime) >= DISK_MOTOR_IDLE_TIMEOUT_MS))
+    {
+        DBG_PRINTLN(F("Disk motor off (Idle timeout)"));
+        ArduinoFDC.motorOff();
     }
-
-    // delay(2000);
 }
-
-#endif
