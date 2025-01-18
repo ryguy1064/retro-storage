@@ -495,21 +495,29 @@ void setRegisterData(uint16_t p, uint8_t data)
 
         case REG_ADDR__DRIVE_LBA+0:
             gDriveLBA = data;
+            // INF_PRINT(data, HEX);
+            // INF_PRINT(' ');
             // gDriveStatus = _BUSY;
             break;
 
         case REG_ADDR__DRIVE_LBA+1:
             gDriveLBA |= ((uint32_t)data << 8);
+            // INF_PRINT(data, HEX);
+            // INF_PRINT(' ');
             // gDriveStatus = _BUSY;
             break;
 
         case REG_ADDR__DRIVE_LBA+2:
             gDriveLBA |= ((uint32_t)data << 16);
+            // INF_PRINT(data, HEX);
+            // INF_PRINT(' ');
             // gDriveStatus = _BUSY;
             break;
 
         case REG_ADDR__DRIVE_LBA+3:
             gDriveLBA |= ((uint32_t)data << 24);
+            // INF_PRINT(data, HEX);
+            // INF_PRINT(" -> ");
             // gDriveStatus = _BUSY;
             break;
 
@@ -537,17 +545,17 @@ void setRegisterData(uint16_t p, uint8_t data)
 }
 
 // RJW: This mapping matches standard Floppies formatted in Windows (when no skew is used)
-void lbaToTrackSector(uint16_t targetLba, uint8_t *diskTrack, uint8_t *diskSide, uint8_t *diskSector, uint8_t sectorSkew)
+void lbaToTrackHeadSector(uint16_t targetLba, uint8_t *diskTrack, uint8_t *diskHead, uint8_t *diskSector, uint8_t sectorSkew)
 {
     uint8_t numSectors = ArduinoFDC.numSectors();
     uint8_t numSectorsX2 = numSectors * 2;
 
-    *diskSide = 0;
-    *diskTrack = targetLba / numSectorsX2;
-    *diskSector = targetLba % numSectorsX2;
+    *diskHead = 0;
+    *diskTrack = (uint8_t)(targetLba / (uint16_t)numSectorsX2);
+    *diskSector = (uint8_t)(targetLba % (uint16_t)numSectorsX2);
     if (*diskSector >= numSectors)
     {
-        *diskSide = 1;
+        *diskHead = 1;
         *diskSector -= numSectors;
     }
     *diskSector += 1;
@@ -569,7 +577,7 @@ void lbaToTrackSector(uint16_t targetLba, uint8_t *diskTrack, uint8_t *diskSide,
     INF_PRINT(F(" -> CHS: "));
     INF_PRINT(*diskTrack);
     INF_PRINT(' ');
-    INF_PRINT(*diskSide);
+    INF_PRINT(*diskHead);
     INF_PRINT(' ');
     INF_PRINT(*diskSector);
 }
@@ -831,7 +839,7 @@ void loop() {
             #else
                 INF_PRINT("READ LBA ");
                 INF_PRINT(gDriveLBA);
-                lbaToTrackSector(gDriveLBA, &track, &side, &sector, gDriveProperties[gDriveSelect].sectorSkew);
+                lbaToTrackHeadSector(gDriveLBA, &track, &side, &sector, gDriveProperties[gDriveSelect].sectorSkew);
                 fdcStatus = ArduinoFDC.readSector(track, side, sector, gFdcBuffer);
             #endif
                 break;
@@ -844,7 +852,7 @@ void loop() {
             #else
                 INF_PRINT("WRITE LBA ");
                 INF_PRINT(gDriveLBA);
-                lbaToTrackSector(gDriveLBA, &track, &side, &sector, gDriveProperties[gDriveSelect].sectorSkew);
+                lbaToTrackHeadSector(gDriveLBA, &track, &side, &sector, gDriveProperties[gDriveSelect].sectorSkew);
                 fdcStatus = ArduinoFDC.writeSector(track, side, sector, gFdcBuffer, false);
             #endif
                 break;
